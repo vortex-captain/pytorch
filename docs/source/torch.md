@@ -1138,6 +1138,7 @@ This feature is a prototype and may have compatibility breaking changes in the f
     :nosignatures:
 
     compile
+    precompile
 ```
 
 [torch.compile documentation](https://docs.pytorch.org/docs/main/user_guide/torch_compiler/torch.compiler.html)
