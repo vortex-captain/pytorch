@@ -3171,8 +3171,8 @@ def _set_unbacked_bindings(out: object, out_proxy: _NestedProxys) -> None:
     # will fail.  Very strange, it probably isn't right for them to be using
     # two fake modes there...
     fake_mode = torch._C._get_dispatch_mode(torch._C._TorchDispatchModeKey.FAKE)
-    if isinstance(fake_mode, FakeTensorMode) and fake_mode.shape_env:
-        symbol_to_path = compute_unbacked_bindings(fake_mode.shape_env, out)
+    if fake_mode and (shape_env := fake_mode.shape_env):  # type: ignore[union-attr]
+        symbol_to_path = compute_unbacked_bindings(shape_env, out)
         if symbol_to_path:
             if not isinstance(out_proxy, Proxy):
                 raise AssertionError(f"Expected Proxy, got {out_proxy}")
