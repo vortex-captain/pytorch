@@ -1032,7 +1032,7 @@ class SIMDKernel(Kernel[CSEVariableType], Generic[CSEVariableType]):
 
         # pointwise node after DisableReduction needs the
         # reduction dim set to its actual iteration size
-        if self.pointwise_loop_numel is not None:
+        if config.polyhedral_fusion and self.pointwise_loop_numel is not None:
             for prefix in tiling:
                 if prefix_is_reduction(prefix):
                     tiling[prefix] = self.pointwise_loop_numel
@@ -1068,17 +1068,22 @@ class SIMDKernel(Kernel[CSEVariableType], Generic[CSEVariableType]):
         ):
             return set_ranges(*lengths)
 
-        try:
-            new_ranges, return_getters_groups = cls._split_iteration_ranges(
-                groups, lengths
-            )
-            itervars = [*itertools.chain.from_iterable(set_ranges(*new_ranges))]
-            return [[fn(itervars) for fn in fns] for fns in return_getters_groups]
-        except CantSplit:
-            perf_hint_log.debug(
-                "CantSplit fallback: groups=%s, lengths=%s", groups, lengths
-            )
-            return set_ranges(*lengths)
+        if config.polyhedral_fusion:
+            try:
+                new_ranges, return_getters_groups = cls._split_iteration_ranges(
+                    groups, lengths
+                )
+                itervars = [*itertools.chain.from_iterable(set_ranges(*new_ranges))]
+                return [[fn(itervars) for fn in fns] for fns in return_getters_groups]
+            except CantSplit:
+                perf_hint_log.debug(
+                    "CantSplit fallback: groups=%s, lengths=%s", groups, lengths
+                )
+                return set_ranges(*lengths)
+
+        new_ranges, return_getters_groups = cls._split_iteration_ranges(groups, lengths)
+        itervars = [*itertools.chain.from_iterable(set_ranges(*new_ranges))]
+        return [[fn(itervars) for fn in fns] for fns in return_getters_groups]
 
     def is_indirect_indexing(self, index: sympy.Expr) -> bool:
         # tmpX  means indirect indexing
@@ -2427,14 +2432,19 @@ class SIMDScheduling(BaseScheduling):
                 schedule_node_in_loop(node)
             elif fits_outside_reduction(node):
                 with end_current_reduction_loop():
-                    _, (node_numel_here, _) = node.group
-                    inner_numel = V.graph.sizevars.simplify(node_numel_here // numel)
-                    if not V.graph.sizevars.statically_known_equals(
-                        inner_numel, sympy.S.One
-                    ):
-                        node_schedule.append(EnablePointwiseLoop(inner_numel))
-                        node_schedule.append(node)
-                        node_schedule.append(DisablePointwiseLoop)
+                    if config.polyhedral_fusion:
+                        _, (node_numel_here, _) = node.group
+                        inner_numel = V.graph.sizevars.simplify(
+                            node_numel_here // numel
+                        )
+                        if not V.graph.sizevars.statically_known_equals(
+                            inner_numel, sympy.S.One
+                        ):
+                            node_schedule.append(EnablePointwiseLoop(inner_numel))
+                            node_schedule.append(node)
+                            node_schedule.append(DisablePointwiseLoop)
+                        else:
+                            node_schedule.append(node)
                     else:
                         node_schedule.append(node)
             else:
