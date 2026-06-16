@@ -44,7 +44,10 @@ if TYPE_CHECKING:
     from ..ir import IRNode
 
 from ..ops_handler import WrapperHandler
-from ..optimize_indexing import indexing_dtype_strength_reduction
+from ..optimize_indexing import (
+    convert_index_expr_to_value_expr,
+    indexing_dtype_strength_reduction,
+)
 from ..runtime.coordinate_descent_tuner import CoordescTuner
 from ..runtime.hints import DeviceProperties
 from ..runtime.runtime_utils import (
@@ -3385,6 +3388,7 @@ class SIMDScheduling(BaseScheduling):
                     pass
                 else:
                     indexing_dtype_strength_reduction(node._body)
+                    convert_index_expr_to_value_expr(node._body)
                     node_ranges = node.get_ranges()
                     index_vars = kernel.split_and_set_ranges(node_ranges)
                     node.codegen(index_vars)
