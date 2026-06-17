@@ -16,6 +16,7 @@ import struct
 import subprocess
 import sys
 import tempfile
+import textwrap
 import threading
 import time
 import types
@@ -102,6 +103,22 @@ if TYPE_CHECKING:
 # cupti-python is pip-installable on ROCm hosts too, but CUPTI itself is a no-op
 # there, so gate the monitor tests off ROCm as well.
 TEST_CUPTI_PYTHON = _check_module_exists("cupti") and not TEST_WITH_ROCM
+
+
+def _cupti_version() -> int:
+    if not TEST_CUPTI_PYTHON:
+        return 0
+    try:
+        from torch.profiler._cupti.cupti_python import pylibcupti
+
+        return pylibcupti().get_version()
+    except Exception:
+        return 0
+
+
+# The CUPTI monitor needs libcupti >= 13.3 (v2 user-defined records + populated
+# pBufferCompleteInfo->ppRecordLayouts); its collection tests skip below that.
+TEST_CUPTI_V13_3 = TEST_CUPTI_PYTHON and _cupti_version() >= 130300
 
 
 def get_profiler_activities(device_type):
@@ -535,78 +552,60 @@ _cupti_monitor.enable_hes_early()
             p.stderr,
         )
 
-    @unittest.skipIf(not TEST_CUPTI_PYTHON, "requires cupti-python")
-    def test_cupti_monitor_collection_raw_dump_smoke(self):
+    @unittest.skipIf(not TEST_CUPTI_V13_3, "requires libcupti >= 13.3")
+    def test_cupti_monitor_collection_smoke(self):
         from torch.profiler._cupti import monitor as _cupti_monitor
+        from torch.profiler._cupti.observers.profiler import ProfilerObserver
 
-        with TemporaryDirectoryName() as out_dir:
-            self.assertIsNone(_cupti_monitor.get_monitor())
-            monitor = _cupti_monitor.start_collection(out_dir)
-            self.assertIs(monitor, _cupti_monitor.get_monitor())
+        obs = ProfilerObserver()
+        self.assertTrue(obs.available)
 
-            x = torch.randn(64, 64, device="cuda")
-            y = torch.relu(x + 1)
+        x = torch.randn(64, 64, device="cuda")
+        y = torch.relu(x + 1)
+        y.sum().item()
+        torch.cuda.synchronize()
+
+        monitor = _cupti_monitor.instance()
+        monitor.flush(forced=True, sync=True)
+        stats = monitor.stats()
+        window = obs.drain()
+        obs.close()
+
+        # The native C++ pool must actually have been exercised: catches a silent
+        # regression to a no-op (e.g. broken callback registration or symbol
+        # export) that would still pass if the worker never saw a buffer. The
+        # monitor demuxes to columns and the observer builds events, so a real
+        # kernel event must come out the other end.
+        self.assertGreater(stats["buffers_allocated"], 0)
+        self.assertGreater(stats["buffers_completed"], 0)
+        self.assertEqual(stats["buffers_pending"], 0)
+        self.assertGreater(len(window["events"]), 0)
+        self.assertTrue(any(e["kind"] == "kernel" for e in window["events"]))
+
+    @unittest.skipIf(not TEST_CUPTI_V13_3, "requires libcupti >= 13.3")
+    def test_cupti_monitor_collection_repeated_lifecycle(self):
+        from torch.profiler._cupti import monitor as _cupti_monitor
+        from torch.profiler._cupti.observers.profiler import ProfilerObserver
+
+        # Register/collect/unregister twice: the last observer leaving stops the
+        # monitor, so the second pass exercises the start-after-stop restart path.
+        for _ in range(2):
+            obs = ProfilerObserver()
+            self.assertTrue(obs.available)
+
+            x = torch.randn(32, 32, device="cuda")
+            y = torch.sigmoid(x)
             y.sum().item()
             torch.cuda.synchronize()
 
-            stats = _cupti_monitor.stop_collection()
-            self.assertIsNotNone(stats)
-            self.assertIsNone(_cupti_monitor.get_monitor())
-            # The native C++ pool must actually have been exercised: catches a
-            # silent regression to a no-op (e.g. broken callback registration or
-            # symbol export) that would still produce passing file-existence
-            # checks if the worker never saw a buffer.
-            self.assertGreater(stats["buffers_allocated"], 0)
-            self.assertGreater(stats["buffers_completed"], 0)
-            self.assertEqual(stats["buffers_pending"], 0)
-            self.assertTrue(
-                os.path.exists(os.path.join(out_dir, _cupti_monitor._META_FILE))
-            )
-            self.assertTrue(
-                os.path.exists(os.path.join(out_dir, _cupti_monitor._RAW_BUFFER_FILE))
-            )
-            self.assertGreater(
-                os.path.getsize(os.path.join(out_dir, _cupti_monitor._META_FILE)), 0
-            )
-            self.assertGreater(
-                os.path.getsize(os.path.join(out_dir, _cupti_monitor._RAW_BUFFER_FILE)),
-                0,
-            )
+            monitor = _cupti_monitor.instance()
+            monitor.flush(forced=True, sync=True)
+            window = obs.drain()
+            obs.close()
 
-    @unittest.skipIf(not TEST_CUPTI_PYTHON, "requires cupti-python")
-    def test_cupti_monitor_collection_repeated_lifecycle(self):
-        from torch.profiler._cupti import monitor as _cupti_monitor
+            self.assertGreater(len(window["events"]), 0)
 
-        for _ in range(2):
-            with TemporaryDirectoryName() as out_dir:
-                self.assertIsNone(_cupti_monitor.get_monitor())
-                _cupti_monitor.start_collection(out_dir)
-
-                x = torch.randn(32, 32, device="cuda")
-                y = torch.sigmoid(x)
-                y.sum().item()
-                torch.cuda.synchronize()
-
-                stats = _cupti_monitor.stop_collection()
-                self.assertIsNotNone(stats)
-                self.assertIsNone(_cupti_monitor.get_monitor())
-
-                self.assertTrue(
-                    os.path.exists(os.path.join(out_dir, _cupti_monitor._META_FILE))
-                )
-                self.assertTrue(
-                    os.path.exists(
-                        os.path.join(out_dir, _cupti_monitor._RAW_BUFFER_FILE)
-                    )
-                )
-                self.assertGreater(
-                    os.path.getsize(
-                        os.path.join(out_dir, _cupti_monitor._RAW_BUFFER_FILE)
-                    ),
-                    0,
-                )
-
-    @unittest.skipIf(not TEST_CUPTI_PYTHON, "requires cupti-python")
+    @unittest.skipIf(not TEST_CUPTI_V13_3, "requires libcupti >= 13.3")
     def test_cupti_monitor_multithread_runtime_thread_assignment(self):
         x1 = torch.randn(256, 256, device="cuda")
         x2 = torch.randn(256, 256, device="cuda")
@@ -680,7 +679,7 @@ _cupti_monitor.enable_hes_early()
         self.assertGreater(len(launch_tids), 0)
         self.assertTrue(set(launch_tids).issubset(set(worker_tids)))
 
-    @unittest.skipIf(not TEST_CUPTI_PYTHON, "requires cupti-python")
+    @unittest.skipIf(not TEST_CUPTI_V13_3, "requires libcupti >= 13.3")
     def test_cupti_monitor_trace_has_expected_events(self):
         cfg = _ExperimentalConfig(
             custom_profiler_config='{"backend":"cupti_monitor"}',
@@ -730,7 +729,7 @@ _cupti_monitor.enable_hes_early()
         }
         self.assertIn("monitor_region", user_names)
 
-    @unittest.skipIf(not TEST_CUPTI_PYTHON, "requires cupti-python")
+    @unittest.skipIf(not TEST_CUPTI_V13_3, "requires libcupti >= 13.3")
     def test_cupti_monitor_record_shapes(self):
         cfg = _ExperimentalConfig(
             custom_profiler_config='{"backend":"cupti_monitor"}',
@@ -760,41 +759,76 @@ _cupti_monitor.enable_hes_early()
         self.assertEqual(shaped_cpu_ops(record_shapes=False), [])
         self.assertGreater(len(shaped_cpu_ops(record_shapes=True)), 0)
 
-    @unittest.skipIf(not TEST_CUPTI_PYTHON, "requires cupti-python")
+    @unittest.skipIf(not TEST_CUPTI_V13_3, "requires libcupti >= 13.3")
     def test_cupti_monitor_matches_stock_op_and_kernel_names(self):
-        def trace_summary(use_monitor):
-            cfg = _ExperimentalConfig(
-                custom_profiler_config='{"backend":"cupti_monitor"}'
-                if use_monitor
-                else ""
-            )
-            with TemporaryFileName(mode="w+") as trace_path:
-                with profile(
-                    activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
-                    experimental_config=cfg,
-                ) as prof:
-                    a = torch.randn(128, 128, device="cuda")
-                    b = torch.randn(128, 128, device="cuda")
-                    (a @ b).relu().sum()
-                    torch.cuda.synchronize()
-                prof.export_chrome_trace(trace_path)
-                with open(trace_path) as f:
-                    events = json.load(f)["traceEvents"]
-            aten_ops = {
-                e["name"]
-                for e in events
-                if e.get("cat") == "cpu_op" and e.get("name", "").startswith("aten::")
-            }
-            n_kernels = sum(
-                1 for e in events if e.get("cat") == "kernel" and e.get("ph") == "X"
-            )
-            return aten_ops, n_kernels
+        # Run in a FRESH process. This test needs a stock (Kineto) CUDA baseline and
+        # then a cupti_monitor session, so it must start from a process that hasn't
+        # touched CUPTI -- immune to whatever earlier tests did to this process's
+        # CUPTI. Inside it, stock (Kineto) runs first, then cuptiFinalize() releases
+        # CUPTI synchronously (rather than Kineto's async TEARDOWN_CUPTI, whose
+        # deferred global finalize races and can deadlock the monitor's teardown) so
+        # the following monitor session can subscribe.
+        import subprocess
 
-        stock_ops, stock_kernels = trace_summary(use_monitor=False)
-        monitor_ops, monitor_kernels = trace_summary(use_monitor=True)
-        self.assertGreater(stock_kernels, 0)
-        self.assertGreater(monitor_kernels, 0)
-        self.assertEqual(monitor_ops, stock_ops)
+        script = textwrap.dedent(
+            """
+            import json, tempfile
+            import torch
+            from torch.profiler import profile, ProfilerActivity
+            from torch._C._profiler import _ExperimentalConfig
+
+            def trace_summary(use_monitor):
+                cfg = _ExperimentalConfig(
+                    custom_profiler_config='{"backend":"cupti_monitor"}'
+                    if use_monitor else "")
+                with tempfile.NamedTemporaryFile("w+", suffix=".json") as f:
+                    with profile(
+                        activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
+                        experimental_config=cfg,
+                    ) as prof:
+                        a = torch.randn(128, 128, device="cuda")
+                        b = torch.randn(128, 128, device="cuda")
+                        (a @ b).relu().sum()
+                        torch.cuda.synchronize()
+                    prof.export_chrome_trace(f.name)
+                    events = json.load(open(f.name))["traceEvents"]
+                aten = {e["name"] for e in events
+                        if e.get("cat") == "cpu_op"
+                        and e.get("name", "").startswith("aten::")}
+                nker = sum(1 for e in events
+                           if e.get("cat") == "kernel" and e.get("ph") == "X")
+                return aten, nker
+
+            stock_ops, stock_kernels = trace_summary(False)
+            # Synchronously release CUPTI from the stock (Kineto) session so the
+            # monitor can subscribe -- cuptiFinalize() now, with nothing else using
+            # CUPTI, instead of Kineto's async TEARDOWN_CUPTI finalize (which races
+            # and can deadlock the monitor's teardown).
+            from torch.profiler._cupti.cupti_python import pylibcupti
+            pylibcupti().finalize()
+            monitor_ops, monitor_kernels = trace_summary(True)
+            assert stock_kernels > 0, f"stock kernels={stock_kernels}"
+            assert monitor_kernels > 0, f"monitor kernels={monitor_kernels}"
+            assert monitor_ops == stock_ops, (
+                f"ops differ: only_stock={sorted(stock_ops - monitor_ops)} "
+                f"only_monitor={sorted(monitor_ops - stock_ops)}")
+            print("OK", stock_kernels, monitor_kernels)
+            """
+        )
+        # The child inherits this process's libcupti (LD_PRELOAD/LD_LIBRARY_PATH) via
+        # the environment.
+        p = subprocess.run(
+            [sys.executable, "-c", script],
+            text=True,
+            capture_output=True,
+            timeout=120,
+        )
+        self.assertEqual(
+            p.returncode,
+            0,
+            f"subprocess failed:\nstdout={p.stdout}\nstderr={p.stderr}",
+        )
+        self.assertIn("OK", p.stdout)
 
 
 @unittest.skipIf(not torch.profiler.itt.is_available(), "ITT is required")
