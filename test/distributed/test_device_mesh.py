@@ -48,13 +48,6 @@ device_type = (
 )
 device_count = torch.accelerator.device_count()
 
-try:
-    import torch._C._distributed_c10d.ProcessGroupNCCL
-
-    _NCCL_AVAILABLE = True
-except ImportError:
-    _NCCL_AVAILABLE = False
-
 
 def _set_env_var(addr="localhost", port="25364", world_size=1, rank=0, local_rank=-1):
     os.environ["MASTER_ADDR"] = addr
@@ -1074,7 +1067,7 @@ class TestDeviceMeshGetItem(DTensorTestBase):
         self.assertEqual(mesh_3d["cp"].get_group(), unflatten_mesh["cp"].get_group())
 
         # Test unflatten with backend override set.
-        if not _NCCL_AVAILABLE:
+        if not dist.is_nccl_available():
             return
         opts = dist.ProcessGroupNCCL.Options()
         opts._timeout = timedelta(seconds=30)

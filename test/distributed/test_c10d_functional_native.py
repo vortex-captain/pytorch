@@ -237,6 +237,16 @@ class TestWithNCCL(DistributedTestBase):
         if not output.completed:
             raise AssertionError("Expected output.completed to be True after access")
 
+        bool_input = torch.tensor(
+            [self.rank == 0, self.rank == 1], dtype=torch.bool, device=self.device
+        )
+        bool_output = all_gather_single(bool_input, 0, "default")
+        self.assertEqual(bool_output.dtype, torch.bool)
+        self.assertEqual(
+            bool_output,
+            torch.tensor([True, False, False, True], device=self.device),
+        )
+
     # https://github.com/pytorch/pytorch/issues/133421
     @skip_if_lt_x_gpu(2)
     def test_functional_collectives_inference_mode(self) -> None:

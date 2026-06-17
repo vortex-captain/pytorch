@@ -206,10 +206,15 @@ def all_gather_single(
     """
     group = _resolve_group(group, tag)
     group_size = c10d._get_group_size_by_name(group)
+    output_dtype = self.dtype
+    if output_dtype is torch.bool:
+        self = self.to(torch.uint8)
     tensor = torch.ops._c10d_functional.all_gather_into_tensor(
         self, group_size, _group_or_group_name(group)
     )
     res = _maybe_wrap_tensor(tensor)
+    if output_dtype is torch.bool:
+        res = res.to(output_dtype)
     if gather_dim != 0:
         # Check if _maybe_view_chunk_cat can use the view optimization.
         # If not, it will use torch.cat which needs the data anyway, so
